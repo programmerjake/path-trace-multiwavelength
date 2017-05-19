@@ -17,20 +17,25 @@
 #include <cstdint>
 #include <type_traits>
 #include <algorithm>
+#include <chrono>
 
 struct DisplayStatus final
 {
-    unsigned percentCompleted = -1;
+    std::uint64_t amountCompleted = -1;
+    static constexpr std::uint64_t amountCompletedSteps = 100000;
     std::uint64_t totalSampleCount = 0;
+    std::chrono::steady_clock::time_point startTime = std::chrono::steady_clock::now();
     std::mutex lock;
     void writeMessage(std::unique_lock<std::mutex> &lockIt)
     {
-        std::cout << percentCompleted << "%\ttotalSampleCount = " << totalSampleCount << std::endl;
+        auto elapsedTime = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - startTime);
+        std::cout << amountCompleted * 100.0 / amountCompletedSteps
+                  << "%\ttotalSampleCount = " << totalSampleCount << "\t" << elapsedTime.count() << " seconds elapsed" << std::endl;
     }
-    void updatePercentCompleted(unsigned newValue)
+    void updateAmountCompleted(std::uint64_t newValue)
     {
         std::unique_lock<std::mutex> lockIt(lock);
-        percentCompleted = newValue;
+        amountCompleted = newValue;
         writeMessage(lockIt);
     }
     void updateTotalSampleCount(std::uint64_t newValue)
@@ -63,7 +68,7 @@ public:
         std::atomic_size_t pixelsDone(0);
         std::vector<std::future<void>> futures;
         std::size_t totalPixels = w * h;
-        displayStatus.updatePercentCompleted(0);
+        displayStatus.updateAmountCompleted(0);
         for(std::size_t y = 0; y < h; y++)
         {
             DisplayStatus &displayStatus = this->displayStatus;
@@ -77,10 +82,10 @@ public:
                             fn(static_cast<std::size_t>(x), static_cast<std::size_t>(y));
                         data[x + w * y] = color;
                         std::size_t pixel = pixelsDone.fetch_add(1, std::memory_order_relaxed);
-                        unsigned oldPercent = pixel * 100ULL / totalPixels;
-                        unsigned newPercent = (pixel + 1) * 100ULL / totalPixels;
-                        if(newPercent > oldPercent)
-                            displayStatus.updatePercentCompleted(newPercent);
+                        std::uint64_t oldAmount = pixel * DisplayStatus::amountCompletedSteps / totalPixels;
+                        std::uint64_t newAmount = (pixel + 1) * DisplayStatus::amountCompletedSteps / totalPixels;
+                        if(newAmount > oldAmount)
+                            displayStatus.updateAmountCompleted(newAmount);
                     }
                 }));
         }
@@ -248,12 +253,9 @@ struct World
             return t < 0 ? false : rt.t < 0 ? true : t < rt.t;
         }
     };
-    struct DiffuseSurface
+    template <typename ChildClass>
+    struct GenericDiffuseSurface
     {
-        float intensity;
-        constexpr explicit DiffuseSurface(float intensity) noexcept : intensity(intensity)
-        {
-        }
         float shade(const RayF &ray,
                     float wavelengthInNanometers,
                     float intensityMultiplier,
@@ -270,10 +272,34 @@ struct World
                 directionDotNormal = -directionDotNormal;
             }
             auto origin = ray.position(intersectionT);
+            float intensity =
+                static_cast<const ChildClass *>(this)->getIntensity(wavelengthInNanometers);
             return world.trace(RayF(origin, direction),
                                wavelengthInNanometers,
                                intensityMultiplier * intensity * std::fabs(directionDotNormal),
                                depth);
+        }
+    };
+    struct GrayDiffuseSurface : public GenericDiffuseSurface<GrayDiffuseSurface>
+    {
+        float intensity;
+        constexpr explicit GrayDiffuseSurface(float intensity) noexcept : intensity(intensity)
+        {
+        }
+        constexpr float getIntensity(float wavelengthInNanometers) const noexcept
+        {
+            return intensity;
+        }
+    };
+    struct ColoredDiffuseSurface : public GenericDiffuseSurface<ColoredDiffuseSurface>
+    {
+        RGBColor color;
+        constexpr explicit ColoredDiffuseSurface(const RGBColor &color) noexcept : color(color)
+        {
+        }
+        constexpr float getIntensity(float wavelengthInNanometers) const noexcept
+        {
+            return color.getIntensityAtWavelength(wavelengthInNanometers);
         }
     };
     struct MirrorSurface
@@ -312,7 +338,7 @@ struct World
                     World &world,
                     const Vector3F &normal) const noexcept
         {
-            return intensityMultiplier * intensity;
+            return intensityMultiplier * intensity * d65Spectrum.get(wavelengthInNanometers);
         }
     };
     template <typename Surface1, typename Surface2>
@@ -489,7 +515,29 @@ struct World
     {
         return ParallelogramObject<Surface>(parallelogram, std::move(surface));
     }
-    struct BackgroundObject
+    static constexpr auto makeCornellBoxObject()
+    {
+        constexpr auto leftFace =
+            makeParallelogramObject(ParallelogramF({-1, -1, -2}, {-1, 1, -2}, {-1, -1, 0}),
+                                    ColoredDiffuseSurface({1, 0, 0}));
+        constexpr auto rightFace = makeParallelogramObject(
+            ParallelogramF({1, -1, -2}, {1, -1, 0}, {1, 1, -2}), ColoredDiffuseSurface({0, 1, 0}));
+        constexpr auto topFace = makeParallelogramObject(
+            ParallelogramF({-1, 1, -2}, {1, 1, -2}, {-1, 1, 0}), GrayDiffuseSurface(1));
+        constexpr auto bottomFace = makeParallelogramObject(
+            ParallelogramF({-1, -1, -2}, {-1, -1, 0}, {1, -1, -2}), GrayDiffuseSurface(1));
+        constexpr auto backFace = makeParallelogramObject(
+            ParallelogramF({-1, -1, -2}, {1, -1, -2}, {-1, 1, -2}), GrayDiffuseSurface(1));
+        constexpr float lightSize = 0.5f;
+        constexpr float lightY = 1 - 1.0 / 1024;
+        constexpr auto light =
+            makeParallelogramObject(ParallelogramF({-lightSize, lightY, -1 - lightSize},
+                                                   {lightSize, lightY, -1 - lightSize},
+                                                   {-lightSize, lightY, -1 + lightSize}),
+                                    EmissiveSurface(10));
+        return makeCompositeObject(leftFace, rightFace, bottomFace, topFace, backFace, light);
+    }
+    struct RayDirectionBackgroundObject
     {
         static constexpr std::size_t objectIndexCount = 1;
         Intersection intersect(const RayF &ray) const noexcept
@@ -505,10 +553,27 @@ struct World
         {
             assert(intersection.objectIndex == 0);
             auto v = euclidianNormalize(ray.direction);
-            v = v * 0.5f + Vector3F(0.5f, 0.5f, 0.5f);
-            auto wavelengthColor = RGBColor::fromWavelength(wavelengthInNanometers);
+            v = v * -0.5f + Vector3F(0.5f, 0.5f, 0.5f);
             return intensityMultiplier
-                   * dot(Vector3F(wavelengthColor.r, wavelengthColor.g, wavelengthColor.b), v);
+                   * RGBColor(v.x, v.y, v.z).getIntensityAtWavelength(wavelengthInNanometers);
+        }
+    };
+    struct BlackBackgroundObject
+    {
+        static constexpr std::size_t objectIndexCount = 1;
+        Intersection intersect(const RayF &ray) const noexcept
+        {
+            return Intersection(1e30, 0);
+        }
+        float shade(const RayF &ray,
+                    float wavelengthInNanometers,
+                    float intensityMultiplier,
+                    std::size_t depth,
+                    const Intersection &intersection,
+                    World &world) const noexcept
+        {
+            assert(intersection.objectIndex == 0);
+            return 0;
         }
     };
     template <typename Object>
@@ -518,7 +583,7 @@ struct World
                       std::size_t depth,
                       const Object &object) noexcept
     {
-        if(depth++ > 5)
+        if(depth++ > 10)
             return 0;
         return object.shade(
             ray, wavelengthInNanometers, intensityMultiplier, depth, object.intersect(ray), *this);
@@ -528,25 +593,21 @@ struct World
                 float intensityMultiplier,
                 std::size_t depth = 0) noexcept
     {
-        constexpr auto object = makeCompositeObject(
-            makeTriangleObject(TriangleF({-1, -1, -2}, {1, -1, -2}, {1, 1, -2}),
-                               makeMixSurface(0.5f, DiffuseSurface(0.9f), MirrorSurface(0.9f))),
-            makeParallelogramObject(ParallelogramF({1, -1, -2}, {1, -1, -1}, {1, 1, -2}),
-                                    EmissiveSurface(10.0f)),
-            BackgroundObject());
+        constexpr auto object =
+            makeCompositeObject(makeCornellBoxObject(), BlackBackgroundObject());
         return traceHelper(ray, wavelengthInNanometers, intensityMultiplier, depth, object);
     }
 };
 
 int main()
 {
-    constexpr std::size_t width = 640;
-    constexpr std::size_t height = 480;
-    constexpr float targetAccuracy = 1.0 / 255;
+    constexpr std::size_t width = 1920;
+    constexpr std::size_t height = 1080;
+    constexpr float targetAccuracy = 0.5 / 0x100;
     constexpr float xScale = width > height ? static_cast<float>(width) / height : 1.0f;
     constexpr float yScale = width > height ? 1.0f : static_cast<float>(height) / width;
     constexpr Point3F origin(0, 0, 0);
-    constexpr std::size_t maxSampleCount = 0x10000;
+    constexpr std::size_t maxSampleCount = 1ULL << 22;
     constexpr std::uint64_t displaySampleCountPeriod = 0x100000;
     DisplayStatus displayStatus;
     ImageWriter imageWriter(displayStatus, width, height);
@@ -554,10 +615,10 @@ int main()
     imageWriter.render(
         [&totalSampleCount, &displayStatus](std::size_t ix, std::size_t iy) -> RGBColor
         {
-            std::vector<RGBColor> sampleColors(maxSampleCount);
+            static thread_local std::vector<RGBColor> sampleColors(maxSampleCount);
             World world;
             world.re.seed(ix + iy * 0x621347UL);
-            std::size_t sampleCount = 500;
+            std::size_t sampleCount = maxSampleCount >> 10;
             RGBColor sumColor{};
             RGBColor averageColor;
             std::size_t sample = 0;
@@ -611,6 +672,7 @@ int main()
 #endif
             return outputColor;
         });
+    displayStatus.updateTotalSampleCount(totalSampleCount.load(std::memory_order_relaxed));
     std::ofstream os("out.hdr", std::ios::binary);
     imageWriter.writeHDR(os);
 }
